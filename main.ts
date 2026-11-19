@@ -41,15 +41,18 @@ const HOUR = 3_600_000;
 
 /** Spread of the rate's logit per square-root day, at the six-day scale the final asks for. */
 const SIGMA_PER_SQRT_DAY = 0.78;
-/** The two-component mixture's weights and shapes: a core and a wider, lower tail. */
+/** The two-component mixture's weights and shapes: a core and a wider tail. */
 const CORE_WEIGHT = 0.8;
 const CORE_SCALE = 0.8;
 const TAIL_SCALE = 1.25;
-const TAIL_DROP = 0.45;
-/** Hours of frozen recording after which the pending refresh is modelled, and its per-hour growth. */
+const TAIL_DROP = 0.12;
+/** Hours of frozen recording after which the pending refresh is modelled, and the priors it falls back on. */
 const STALE_HOURS = 1.5;
-const STALE_TRACKED_GROWTH = 0.25;
-const STALE_EARNER_GROWTH = 0.06;
+const STALE_CAP_HOURS = 8;
+const STALE_TRACKED_GROWTH = 0.4;
+const STALE_EARNER_GROWTH = 0.02;
+/** Above this rate a trophy is "everyone has it", and its quantiles are read off the ceiling instead. */
+const CEILING_RATE = 99.5;
 /** Shrinkage length: how many reads a trophy's own slope needs to outweigh the pooled one. */
 const SHRINK_READS = 6;
 
@@ -130,11 +133,14 @@ function isotonicDown(values: number[]): number[] {
 }
 
 /** Quantiles of the two-component logit mixture around a median `m` with base spread `s`. */
-function mixtureQuantiles(m: number, s: number): number[] {
+function mixtureQuantiles(m: number, s: number, lean = 0): number[] {
   const tail = 1 - CORE_WEIGHT;
+  // `lean` turns the tail over: a trophy pinned against the floor can only gain, so its second
+  // component sits above the median instead of below it
+  const tailAt = lean > 0 ? m + 0.4 * lean * s : m - TAIL_DROP * s;
   const cdf = (y: number): number => {
     const core = 0.5 * (1 + erf((y - m) / (s * CORE_SCALE * Math.SQRT2)));
-    const low = 0.5 * (1 + erf((y - (m - TAIL_DROP * s)) / (s * TAIL_SCALE * Math.SQRT2)));
+    const low = 0.5 * (1 + erf((y - tailAt) / (s * TAIL_SCALE * Math.SQRT2)));
     return CORE_WEIGHT * core + tail * low;
   };
   const out: number[] = [];
@@ -172,7 +178,10 @@ interface Frame {
   trackedLast: number;
   trackedSlope: number;
   trackedSd: number;
+  /** Hours the recording has been frozen past the modelled threshold, and how much grew underneath it. */
   staleHours: number;
+  trackedPerHour: number;
+  earnerPerHour: number[];
 }
 
 /** The case's reads, deduplicated to the changes a page refresh made, and the frame around them. */
@@ -204,13 +213,31 @@ function frameOf(c: Case): Frame {
   const distinct = new Set(reads.map((r) => r.tracked)).size;
   const trackedSlope = distinct >= 3 && fit.n >= 3 ? clamp(fit.b, 0, 1.4) : 0;
 
-  // how long the recording has been frozen: from the last read that differed from the one before
+  // how long the recording has been frozen, and how fast the two parts moved between refreshes:
+  // the ratio's own history is the best estimate of what the next refresh will show
+  const changeAt = 24 * HOUR;
   let lastChange = reads[0]!.t;
+  let dTracked = 0, dtTracked = 0;
+  const dEarner: number[] = c.trophies.map(() => 0);
+  const dtEarner: number[] = c.trophies.map(() => 0);
   for (let i = 1; i < reads.length; i++) {
     const a = reads[i - 1]!, b = reads[i]!;
-    if (a.tracked !== b.tracked || a.rates.some((r, j) => r !== b.rates[j])) lastChange = b.t;
+    const dt = (b.t - a.t) / HOUR;
+    const moved = a.tracked !== b.tracked || a.rates.some((r, j) => r !== b.rates[j]);
+    if (!moved) continue;
+    lastChange = b.t;
+    if (b.t < last.t - changeAt || dt <= 0) continue;
+    if (a.tracked > 0 && b.tracked > a.tracked) { dTracked += Math.log(b.tracked / a.tracked); dtTracked += dt; }
+    for (let j = 0; j < c.trophies.length; j++) {
+      const ra = a.rates[j], rb = b.rates[j];
+      if (ra === null || ra === undefined || rb === null || rb === undefined) continue;
+      const ea = Math.max(0.6, (ra / 100) * a.tracked), eb = Math.max(0.6, (rb / 100) * b.tracked);
+      if (eb <= ea) continue;
+      dEarner[j]! += Math.log(eb / ea);
+      dtEarner[j]! += dt;
+    }
   }
-  const staleHours = Math.max(0, (targetT - lastChange) / HOUR - STALE_HOURS);
+  const staleHours = clamp((targetT - lastChange) / HOUR - STALE_HOURS, 0, STALE_CAP_HOURS);
 
   return {
     reads,
@@ -221,6 +248,8 @@ function frameOf(c: Case): Frame {
     trackedSlope,
     trackedSd: distinct >= 3 ? fit.sd : 0,
     staleHours,
+    trackedPerHour: dtTracked > 0 ? dTracked / dtTracked : STALE_TRACKED_GROWTH,
+    earnerPerHour: c.trophies.map((_, j) => (dtEarner[j]! > 0 ? dEarner[j]! / dtEarner[j]! : STALE_EARNER_GROWTH)),
   };
 }
 
@@ -231,7 +260,7 @@ function medians(c: Case, f: Frame): number[] {
 
   // denominator at the target
   let tracked = f.trackedLast * Math.pow(ratio, f.trackedSlope);
-  tracked *= Math.exp(STALE_TRACKED_GROWTH * f.staleHours);
+  tracked *= Math.exp(f.trackedPerHour * f.staleHours);
   tracked = Math.max(tracked, f.trackedLast);
 
   // earners at the target, per trophy: a power law shrunk toward the pooled slope
@@ -287,11 +316,11 @@ function medians(c: Case, f: Frame): number[] {
     }
     beta = clamp(beta, -0.8, 2.6);
     let e = s.eLast * Math.pow(ratio, beta);
-    e *= Math.exp(STALE_EARNER_GROWTH * f.staleHours);
+    e *= Math.exp(f.earnerPerHour[i]! * f.staleHours);
     let rate = (100 * e) / tracked;
     // the trophy everyone has stays where it is: a 100% prologue cannot lose its crowd in a week
     const lastRate = latestRate(f, i);
-    if (lastRate !== null && lastRate >= 99.5) rate = Math.max(rate, 99.9);
+    if (lastRate !== null && lastRate >= CEILING_RATE) rate = Math.max(rate, 99.9);
     out.push(clamp(rate, 0.001, 99.99));
   }
   return out;
@@ -338,8 +367,16 @@ for (const file of inputs) {
     const fitted = isotonicDown(chain.map((i) => rateLogit(m[i]!)));
     chain.forEach((i, k) => { m[i] = expit(fitted[k]!); });
   }
-  const s = SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48)) * (1 + 0.35 * (f.staleHours > 0 ? 1 : 0));
-  const rows: Row[] = c.trophies.map((t, i) => ({ id: t.id, q: mixtureQuantiles(rateLogit(m[i]!), s) }));
+  const s = SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48))
+    + 0.5 * Math.sqrt(f.staleHours) * (f.staleHours > 0 ? 1 : 0);
+  const rows: Row[] = c.trophies.map((t, i) => {
+    const last = latestRate(f, i);
+    // a trophy at the ceiling cannot go up: its five quantiles sit in the last hundredth of a percent
+    if (last !== null && last >= CEILING_RATE) return { id: t.id, q: [99.9, 99.96, 99.99, 99.99, 99.99] };
+    // a rate against the floor has far more room to rise than to fall: its tail leans up
+    const lean = m[i]! < 0.05 ? 1 : m[i]! < 0.15 ? 0.5 : 0;
+    return { id: t.id, q: mixtureQuantiles(rateLogit(m[i]!), s, lean) };
+  });
   outputs.push({ file: `${id}.out`, rows });
   void Z;
 }
