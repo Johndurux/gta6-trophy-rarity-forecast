@@ -40,21 +40,22 @@ const Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.64
 const HOUR = 3_600_000;
 
 /** Spread of the rate's logit per square-root day, at the six-day scale the final asks for. */
-const SIGMA_PER_SQRT_DAY = 0.78;
+const SIGMA_PER_SQRT_DAY = Number(process.env.EVAL_SIGMA ?? 0.78);
 /** The two-component mixture's weights and shapes: a core and a wider tail. */
 const CORE_WEIGHT = 0.8;
 const CORE_SCALE = 0.8;
 const TAIL_SCALE = 1.25;
 const TAIL_DROP = 0.12;
 /** Hours of frozen recording after which the pending refresh is modelled, and the priors it falls back on. */
-const STALE_HOURS = 1.5;
-const STALE_CAP_HOURS = 8;
+const DEFAULT_TRACKED_SLOPE = 0.9;
+/** Hours of history the slopes are fitted on: the launch week changes regime, so recent reads count more. */
+const FIT_HOURS = 48;
 /**
  * Per-hour growth of the tracked base while a frozen page waits for its refresh, when the case's
  * own refreshes measured none: the launch week's own curve, decaying as the game ages (a page
  * frozen four hours after launch gains far more per hour than one frozen on day three).
  */
-const STALE_TRACKED_GROWTH = Number(process.env.EVAL_STALE_TRACKED ?? 0.62);
+const STALE_TRACKED_GROWTH = Number(process.env.EVAL_STALE_TRACKED ?? 0.65);
 const STALE_EARNER_GROWTH = Number(process.env.EVAL_STALE_EARNER ?? 0.02);
 /** Above this rate a trophy is "everyone has it", and its quantiles are read off the ceiling instead. */
 const CEILING_RATE = 99.5;
@@ -178,13 +179,14 @@ const hoursOf = (t: number, t0: number): number => (t - t0) / HOUR + 1;
 interface Frame {
   reads: Read[];
   hLast: number;
+  hCut: number;
   hTarget: number;
   days: number;
   trackedLast: number;
   trackedSlope: number;
   trackedSd: number;
-  /** Hours the recording has been frozen past the modelled threshold, and how much grew underneath it. */
-  staleHours: number;
+  /** Hours between the recording's last change and the checkpoint: what the page has not shown yet. */
+  backlogHours: number;
   trackedPerHour: number;
   earnerPerHour: number[];
 }
@@ -200,13 +202,14 @@ function frameOf(c: Case): Frame {
   if (reads.length === 0) throw new Error(`${c.id} has no usable read`);
   reads.sort((a, b) => a.t - b.t);
   const targetT = Date.parse(c.target);
+  const cutT = Number.isFinite(Date.parse(c.at)) ? Date.parse(c.at) : reads[reads.length - 1]!.t;
   const t0 = reads[0]!.t;
   const last = reads[reads.length - 1]!;
   const days = c.horizon_minutes / 1440;
 
   // the denominator: log-log over the reads of the last 60 hours, which is where the launch's
   // growth curve is still being traced
-  const from = last.t - 60 * HOUR;
+  const from = last.t - FIT_HOURS * HOUR;
   const tx: number[] = [], ty: number[] = [];
   for (const r of reads) {
     if (r.t < from) continue;
@@ -242,17 +245,20 @@ function frameOf(c: Case): Frame {
       dtEarner[j]! += dt;
     }
   }
-  const staleHours = clamp((targetT - lastChange) / HOUR - STALE_HOURS, 0, STALE_CAP_HOURS);
+  // a read every ten minutes and a refresh every half hour means half an hour of backlog is normal,
+  // not staleness: the backlog starts where the recorder's own cadence ends
+  const backlogHours = clamp((cutT - lastChange) / HOUR - 0.5, 0, 12);
 
   return {
     reads,
     hLast: hoursOf(last.t, t0),
+    hCut: hoursOf(cutT, t0),
     hTarget: hoursOf(targetT, t0),
     days,
     trackedLast: last.tracked,
     trackedSlope,
     trackedSd: distinct >= 3 ? fit.sd : 0,
-    staleHours,
+    backlogHours,
     trackedPerHour: dtTracked > 0
       ? dTracked / dtTracked
       : STALE_TRACKED_GROWTH * (24 / (24 + hoursOf(last.t, t0))),
@@ -274,13 +280,15 @@ function medians(c: Case, f: Frame): number[] {
 
 /**
  * The absolute-flow extrapolator: earners and tracked players each advance at the per-hour rate
- * the last day measured, so the rate is the ratio of two straight lines. It says nothing about a
- * page that never moved, so a frozen recording falls back to the power law's refresh prior.
+ * the last day measured, so the rate is the ratio of two straight lines. The reference read is
+ * the last one at least a day old, which averages over the page's plateaus; a frozen page adds
+ * the same pending-refresh correction the power law applies.
  */
 function mediansFlow(c: Case, f: Frame): number[] {
   const last = f.reads[f.reads.length - 1]!;
   const back = last.t - 24 * HOUR;
-  const ref = f.reads.find((r) => r.t >= back) ?? f.reads[0]!;
+  let ref = f.reads[0]!;
+  for (const r of f.reads) if (r.t <= back) ref = r;
   const dt = (last.t - ref.t) / HOUR;
   const ahead = Math.max(0, f.hTarget - f.hLast);
   if (dt < 1 || last.tracked <= ref.tracked) {
@@ -288,7 +296,8 @@ function mediansFlow(c: Case, f: Frame): number[] {
     return mediansPower(c, f);
   }
   const perHourT = (last.tracked - ref.tracked) / dt;
-  const tracked = Math.max(last.tracked, last.tracked + perHourT * ahead);
+  const tracked = Math.max(last.tracked, last.tracked + perHourT * ahead)
+    * Math.exp(f.trackedPerHour * f.backlogHours);
   const out: number[] = [];
   for (let i = 0; i < c.trophies.length; i++) {
     const rl = latestRate(f, i);
@@ -299,25 +308,26 @@ function mediansFlow(c: Case, f: Frame): number[] {
       const perHourE = Math.max(0, (e - eRef) / dt);
       e = e + perHourE * ahead;
     }
+    e *= Math.exp(f.earnerPerHour[i]! * f.backlogHours);
     const rate = (100 * e) / tracked;
     out.push(clamp(rl !== null && rl >= CEILING_RATE ? Math.max(rate, 99.9) : rate, 0.001, 99.99));
   }
-
   return out;
 }
 
 /** The median rate of each trophy at the target, in the case's trophy order. */
 function mediansPower(c: Case, f: Frame): number[] {
   const t0 = f.reads[0]!.t;
-  const ratio = f.hTarget / f.hLast;
+  const ratio = f.hTarget / f.hCut;
+  // a flat recording still belongs to a launch week: its slope is the week's usual one
+  const bTracked = f.trackedSlope > 0.15 ? f.trackedSlope : DEFAULT_TRACKED_SLOPE;
 
-  // denominator at the target
-  let tracked = f.trackedLast * Math.pow(ratio, f.trackedSlope);
-  tracked *= Math.exp(f.trackedPerHour * f.staleHours);
-  tracked = Math.max(tracked, f.trackedLast);
+  // denominator: the last read carries the page's backlog, then the fitted curve runs to the target
+  const trackedCut = f.trackedLast * Math.exp(f.trackedPerHour * f.backlogHours);
+  const tracked = Math.max(trackedCut, trackedCut * Math.pow(ratio, bTracked));
 
   // earners at the target, per trophy: a power law shrunk toward the pooled slope
-  const from = f.reads[f.reads.length - 1]!.t - 60 * HOUR;
+  const from = f.reads[f.reads.length - 1]!.t - FIT_HOURS * HOUR;
   const slopes: Array<{ b: number; n: number; eLast: number }> = [];
   const xsAll: number[] = [], ysAll: number[] = [], wAll: number[] = [];
   for (let i = 0; i < c.trophies.length; i++) {
@@ -368,8 +378,8 @@ function mediansPower(c: Case, f: Frame): number[] {
       beta = clamp(beta, pool - 1.1, pool + 1.1);
     }
     beta = clamp(beta, -0.8, 2.6);
-    let e = s.eLast * Math.pow(ratio, beta);
-    e *= Math.exp(f.earnerPerHour[i]! * f.staleHours);
+    let e = s.eLast * Math.exp(f.earnerPerHour[i]! * f.backlogHours);
+    e *= Math.pow(ratio, beta);
     let rate = (100 * e) / tracked;
     // the trophy everyone has stays where it is: a 100% prologue cannot lose its crowd in a week
     const lastRate = latestRate(f, i);
@@ -421,7 +431,7 @@ for (const file of inputs) {
     chain.forEach((i, k) => { m[i] = expit(fitted[k]!); });
   }
   const s = SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48))
-    + Number(process.env.EVAL_STALE_SIGMA ?? 0.28) * Math.sqrt(f.staleHours);
+    + Number(process.env.EVAL_STALE_SIGMA ?? 0.2) * Math.sqrt(f.backlogHours);
   const rows: Row[] = c.trophies.map((t, i) => {
     const last = latestRate(f, i);
     // a trophy at the ceiling cannot go up: its five quantiles sit in the last hundredth of a percent
