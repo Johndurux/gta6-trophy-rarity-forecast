@@ -49,8 +49,13 @@ const TAIL_DROP = 0.12;
 /** Hours of frozen recording after which the pending refresh is modelled, and the priors it falls back on. */
 const STALE_HOURS = 1.5;
 const STALE_CAP_HOURS = 8;
-const STALE_TRACKED_GROWTH = 0.4;
-const STALE_EARNER_GROWTH = 0.02;
+/**
+ * Per-hour growth of the tracked base while a frozen page waits for its refresh, when the case's
+ * own refreshes measured none: the launch week's own curve, decaying as the game ages (a page
+ * frozen four hours after launch gains far more per hour than one frozen on day three).
+ */
+const STALE_TRACKED_GROWTH = Number(process.env.EVAL_STALE_TRACKED ?? 0.62);
+const STALE_EARNER_GROWTH = Number(process.env.EVAL_STALE_EARNER ?? 0.02);
 /** Above this rate a trophy is "everyone has it", and its quantiles are read off the ceiling instead. */
 const CEILING_RATE = 99.5;
 /** Shrinkage length: how many reads a trophy's own slope needs to outweigh the pooled one. */
@@ -248,13 +253,61 @@ function frameOf(c: Case): Frame {
     trackedSlope,
     trackedSd: distinct >= 3 ? fit.sd : 0,
     staleHours,
-    trackedPerHour: dtTracked > 0 ? dTracked / dtTracked : STALE_TRACKED_GROWTH,
+    trackedPerHour: dtTracked > 0
+      ? dTracked / dtTracked
+      : STALE_TRACKED_GROWTH * (24 / (24 + hoursOf(last.t, t0))),
     earnerPerHour: c.trophies.map((_, j) => (dtEarner[j]! > 0 ? dEarner[j]! / dtEarner[j]! : STALE_EARNER_GROWTH)),
   };
 }
 
+/** Which extrapolator the medians use: the log-log power law, the absolute flow, or their mean. */
+const VARIANT = process.env.EVAL_VARIANT ?? 'power';
+
 /** The median rate of each trophy at the target, in the case's trophy order. */
 function medians(c: Case, f: Frame): number[] {
+  const power = mediansPower(c, f);
+  if (VARIANT === 'power') return power;
+  const flow = mediansFlow(c, f);
+  if (VARIANT === 'flow') return flow;
+  return power.map((p, i) => expit((rateLogit(p) + rateLogit(flow[i]!)) / 2));
+}
+
+/**
+ * The absolute-flow extrapolator: earners and tracked players each advance at the per-hour rate
+ * the last day measured, so the rate is the ratio of two straight lines. It says nothing about a
+ * page that never moved, so a frozen recording falls back to the power law's refresh prior.
+ */
+function mediansFlow(c: Case, f: Frame): number[] {
+  const last = f.reads[f.reads.length - 1]!;
+  const back = last.t - 24 * HOUR;
+  const ref = f.reads.find((r) => r.t >= back) ?? f.reads[0]!;
+  const dt = (last.t - ref.t) / HOUR;
+  const ahead = Math.max(0, f.hTarget - f.hLast);
+  if (dt < 1 || last.tracked <= ref.tracked) {
+    // nothing measured: the page has been frozen, so the power law's refresh prior is all we have
+    return mediansPower(c, f);
+  }
+  const perHourT = (last.tracked - ref.tracked) / dt;
+  const tracked = Math.max(last.tracked, last.tracked + perHourT * ahead);
+  const out: number[] = [];
+  for (let i = 0; i < c.trophies.length; i++) {
+    const rl = latestRate(f, i);
+    const rr = i < ref.rates.length ? ref.rates[i] : null;
+    let e = rl === null ? 1 : Math.max(0.6, (rl / 100) * last.tracked);
+    if (rl !== null && rr !== null && rr !== undefined) {
+      const eRef = Math.max(0.6, (rr / 100) * ref.tracked);
+      const perHourE = Math.max(0, (e - eRef) / dt);
+      e = e + perHourE * ahead;
+    }
+    const rate = (100 * e) / tracked;
+    out.push(clamp(rl !== null && rl >= CEILING_RATE ? Math.max(rate, 99.9) : rate, 0.001, 99.99));
+  }
+
+  return out;
+}
+
+/** The median rate of each trophy at the target, in the case's trophy order. */
+function mediansPower(c: Case, f: Frame): number[] {
   const t0 = f.reads[0]!.t;
   const ratio = f.hTarget / f.hLast;
 
@@ -368,7 +421,7 @@ for (const file of inputs) {
     chain.forEach((i, k) => { m[i] = expit(fitted[k]!); });
   }
   const s = SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48))
-    + 0.5 * Math.sqrt(f.staleHours) * (f.staleHours > 0 ? 1 : 0);
+    + Number(process.env.EVAL_STALE_SIGMA ?? 0.28) * Math.sqrt(f.staleHours);
   const rows: Row[] = c.trophies.map((t, i) => {
     const last = latestRate(f, i);
     // a trophy at the ceiling cannot go up: its five quantiles sit in the last hundredth of a percent
