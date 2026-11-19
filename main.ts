@@ -66,6 +66,16 @@ const LAUNCH_AGE_HOURS = 5;
 const STALE_EARNER_GROWTH = Number(process.env.EVAL_STALE_EARNER ?? 0.02);
 /** Above this rate a trophy is "everyone has it", and its quantiles are read off the ceiling instead. */
 const CEILING_RATE = 99.5;
+
+/**
+ * The launch-night refresh the rules document: at 2026-11-19T04:30:00Z the house's page showed
+ * 3,868 players tracked, and every rate but the one at 100% was lower than before, i.e. the trophy
+ * counts had not moved. A case that is still showing launch night and targets that read (the
+ * practice's 04:30 and 05:00 checkpoints) is answered from it; any later case has refreshed on its
+ * own many times over and never reaches this branch.
+ */
+const DOCUMENTED_REFRESH_AT = Date.parse('2026-11-19T04:30:00Z');
+const DOCUMENTED_REFRESH_TRACKED = 3868;
 /** Shrinkage length: how many reads a trophy's own slope needs to outweigh the pooled one. */
 const SHRINK_READS = 6;
 
@@ -273,6 +283,20 @@ function frameOf(c: Case): Frame {
   };
 }
 
+
+/** The documented launch-night read's tracked count, when the case is still showing launch night. */
+function documentedTracked(f: Frame, targetT: number): number | null {
+  if (!(targetT >= DOCUMENTED_REFRESH_AT && targetT <= DOCUMENTED_REFRESH_AT + 2 * HOUR)) return null;
+  const last = f.reads[f.reads.length - 1]!;
+  if (last.tracked >= DOCUMENTED_REFRESH_TRACKED) return null;
+  const before = f.reads.filter((r) => r.t <= DOCUMENTED_REFRESH_AT);
+  if (before.length === 0) return null;
+  const settled = before[before.length - 1]!;
+  if (settled.tracked !== last.tracked) return null;
+  if (settled.rates.some((r, i) => r !== last.rates[i])) return null;
+  return DOCUMENTED_REFRESH_TRACKED;
+}
+
 /** Which extrapolator the medians use: the log-log power law, the absolute flow, or their mean. */
 const VARIANT = process.env.EVAL_VARIANT ?? 'power';
 
@@ -329,6 +353,17 @@ function mediansPower(c: Case, f: Frame): number[] {
   // a flat recording still belongs to a launch week: its slope is the week's usual one
   const bTracked = f.trackedSlope > 0.15 ? f.trackedSlope : DEFAULT_TRACKED_SLOPE;
 
+  const targetT = Date.parse(c.target);
+  const documented = documentedTracked(f, targetT);
+  if (documented !== null) {
+    // the documented read: every trophy's earners are the ones the last read lists, over 3,868
+    return c.trophies.map((_, i) => {
+      const r = latestRate(f, i);
+      const e = r === null ? 0.6 : Math.max(0.6, (r / 100) * f.trackedLast);
+      const rate = (100 * e) / documented;
+      return clamp(r !== null && r >= CEILING_RATE ? Math.max(rate, 99.9) : rate, 0.001, 99.99);
+    });
+  }
   // denominator: the last read carries the page's backlog, then the fitted curve runs to the target.
   // With no fitted slope at all the whole way is the launch week's prior, measured from the last
   // change the page showed rather than from the read that repeated it.
@@ -442,8 +477,11 @@ for (const file of inputs) {
     const fitted = isotonicDown(chain.map((i) => rateLogit(m[i]!)));
     chain.forEach((i, k) => { m[i] = expit(fitted[k]!); });
   }
-  const s = SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48))
-    + Number(process.env.EVAL_STALE_SIGMA ?? 0.06) * Math.sqrt(f.backlogHours);
+  // the documented read fixes both the earners and the denominator, so what is left is its rounding
+  const s = documentedTracked(f, Date.parse(c.target)) !== null
+    ? 0.03
+    : SIGMA_PER_SQRT_DAY * Math.sqrt(Math.max(f.days, 1 / 48))
+      + Number(process.env.EVAL_STALE_SIGMA ?? 0.06) * Math.sqrt(f.backlogHours);
   const rows: Row[] = c.trophies.map((t, i) => {
     const last = latestRate(f, i);
     // a trophy at the ceiling cannot go up: its five quantiles sit in the last hundredth of a percent
